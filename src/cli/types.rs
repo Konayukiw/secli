@@ -35,6 +35,12 @@ pub struct Cli {
 
     #[arg(long, default_value = DEFAULT_NIC_NAME)]
     pub nic: String,
+
+    #[arg(long, value_name = "DOMAIN|IP|CIDR")]
+    pub focus: Vec<String>,
+
+    #[arg(long, value_name = "DOMAIN|IP|CIDR")]
+    pub exclude: Vec<String>,
 }
 
 #[derive(Subcommand)]
@@ -81,6 +87,17 @@ pub enum Commands {
 
         #[arg(long, default_value = "5")]
         retry_count: usize,
+
+        #[arg(long, value_name = "DOMAIN|IP|CIDR")]
+        focus: Vec<String>,
+
+        #[arg(long, value_name = "DOMAIN|IP|CIDR")]
+        exclude: Vec<String>,
+    },
+
+    Split {
+        #[command(subcommand)]
+        action: SplitAction,
     },
 
     Disconnect {
@@ -95,6 +112,17 @@ pub enum Commands {
 
     Accounts,
     Nics,
+}
+
+#[derive(Subcommand)]
+pub enum SplitAction {
+    Status,
+    Refresh,
+    Watch {
+        #[arg(long, default_value = "300")]
+        interval: u64,
+    },
+    Clear,
 }
 
 #[derive(Tabled)]

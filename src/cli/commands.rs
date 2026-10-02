@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{bail, Result};
 use clap::Parser;
 use std::thread::sleep;
 use std::time::Duration;
@@ -6,17 +6,29 @@ use tabled::settings::Style;
 use tabled::Table;
 
 use super::types::{
-    Cli, Commands, ServerRow, DEFAULT_ACCOUNT_NAME, DEFAULT_HUB, DEFAULT_USER,
+    Cli, Commands, ServerRow, SplitAction, DEFAULT_ACCOUNT_NAME, DEFAULT_HUB, DEFAULT_USER,
 };
 use crate::filter::{check_tcp_reachability, filter_servers, sort_servers, SortKey};
 use crate::installer;
 use crate::softether::VpnCmd;
+use crate::split;
 use crate::vpngate::{fetch_vpn_servers, VpnServer};
 
 pub fn run() -> Result<()> {
     let cli = Cli::parse();
+    let Cli {
+        command,
+        auto,
+        sort: g_sort,
+        country: g_country,
+        max_ping: g_max_ping,
+        min_speed: g_min_speed,
+        nic: g_nic,
+        focus: g_focus,
+        exclude: g_exclude,
+    } = cli;
 
-    match cli.command {
+    match command {
         Some(Commands::Install) => {
             installer::install_self()?;
         }
@@ -38,9 +50,15 @@ pub fn run() -> Result<()> {
             max_ping,
             min_speed,
             retry_count,
+            focus,
+            exclude,
         }) => {
+            let mut f = g_focus;
+            f.extend(focus);
+            let mut e = g_exclude;
+            e.extend(exclude);
             if let Some(target_ip) = ip {
-                cmd_connect_direct(&target_ip, port, &nic)?;
+                cmd_connect_direct(&target_ip, port, &nic, f, e)?;
             } else {
                 cmd_auto_connect(
                     sort,
@@ -49,8 +67,13 @@ pub fn run() -> Result<()> {
                     min_speed,
                     &nic,
                     retry_count,
+                    f,
+                    e,
                 )?;
             }
+        }
+        Some(Commands::Split { action }) => {
+            cmd_split(action)?;
         }
         Some(Commands::Disconnect { account }) => {
             cmd_disconnect(&account)?;
@@ -74,22 +97,24 @@ pub fn run() -> Result<()> {
             }
         }
         None => {
-            if cli.auto {
+            if auto {
                 cmd_auto_connect(
-                    cli.sort,
-                    cli.country.as_deref(),
-                    cli.max_ping,
-                    cli.min_speed,
-                    &cli.nic,
+                    g_sort,
+                    g_country.as_deref(),
+                    g_max_ping,
+                    g_min_speed,
+                    &g_nic,
                     5,
+                    g_focus,
+                    g_exclude,
                 )?;
             } else {
                 println!("Fetching VPN Gate server list...\n");
                 cmd_list(
-                    cli.sort,
-                    cli.country.as_deref(),
-                    cli.max_ping,
-                    cli.min_speed,
+                    g_sort,
+                    g_country.as_deref(),
+                    g_max_ping,
+                    g_min_speed,
                     20,
                 )?;
                 println!(
@@ -137,7 +162,14 @@ fn cmd_list(
     Ok(())
 }
 
-fn cmd_connect_direct(ip: &str, custom_port: Option<u16>, nic_name: &str) -> Result<()> {
+fn cmd_connect_direct(
+    ip: &str,
+    custom_port: Option<u16>,
+    nic_name: &str,
+    focus: Vec<String>,
+    exclude: Vec<String>,
+) -> Result<()> {
+    let plan = SplitPlan::prepare(focus, exclude, nic_name)?;
     let nic = VpnCmd::ensure_nic(nic_name)?;
 
     let port = if let Some(p) = custom_port {
@@ -159,6 +191,7 @@ fn cmd_connect_direct(ip: &str, custom_port: Option<u16>, nic_name: &str) -> Res
         "Connecting to {} on port {} using NIC '{}'...",
         ip, port, nic
     );
+    plan.pin_vpn_server_route(ip)?;
     VpnCmd::connect(
         DEFAULT_ACCOUNT_NAME,
         ip,
@@ -169,6 +202,7 @@ fn cmd_connect_direct(ip: &str, custom_port: Option<u16>, nic_name: &str) -> Res
     )?;
 
     wait_for_connection(DEFAULT_ACCOUNT_NAME, ip, port, 10)?;
+    plan.finish_after_connect()?;
     Ok(())
 }
 
@@ -180,7 +214,10 @@ fn cmd_auto_connect(
     min_speed: Option<f64>,
     nic_name: &str,
     retry_count: usize,
+    focus: Vec<String>,
+    exclude: Vec<String>,
 ) -> Result<()> {
+    let plan = SplitPlan::prepare(focus, exclude, nic_name)?;
     let nic = VpnCmd::ensure_nic(nic_name)?;
 
     println!("Fetching available servers from VPN Gate...");
@@ -224,6 +261,7 @@ fn cmd_auto_connect(
         println!("Reachable!");
 
         print!("  Initiating VPN connection... ");
+        plan.pin_vpn_server_route(&server.ip)?;
         if let Err(e) = VpnCmd::connect(
             DEFAULT_ACCOUNT_NAME,
             &server.ip,
@@ -240,6 +278,9 @@ fn cmd_auto_connect(
         match wait_for_connection(DEFAULT_ACCOUNT_NAME, &server.ip, server.port, 8) {
             Ok(_) => {
                 connected = true;
+                if let Err(e) = plan.finish_after_connect() {
+                    eprintln!("  [!] split routing setup failed: {:#}", e);
+                }
                 break;
             }
             Err(e) => {
@@ -286,6 +327,14 @@ fn wait_for_connection(
 
 fn cmd_disconnect(account: &str) -> Result<()> {
     println!("Disconnecting VPN session for '{}'...", account);
+    match split::load_state() {
+        Ok(st) => {
+            println!("Removing {} split route(s)...", st.routes.len());
+            split::remove_routes(&st.routes);
+            let _ = std::fs::remove_file(split::stored_state_path());
+        }
+        Err(_) => {}
+    }
     VpnCmd::disconnect(account)?;
     sleep(Duration::from_millis(500));
     VpnCmd::delete_account(account)?;
@@ -303,6 +352,311 @@ fn cmd_status(account: &str) -> Result<()> {
             println!("Account '{}' is offline or not found: {}", account, e);
         }
     }
+    Ok(())
+}
+
+struct SplitPlan {
+    focus_specs: Vec<String>,
+    focus: Vec<split::RouteTarget>,
+    exclude: Vec<split::RouteTarget>,
+    original_gateway: Option<String>,
+    nic_name: String,
+}
+
+impl SplitPlan {
+    fn prepare(focus: Vec<String>, exclude: Vec<String>, nic_name: &str) -> Result<Self> {
+        let focus_flat = split::split_list_arg(&focus);
+        let exclude_flat = split::split_list_arg(&exclude);
+        if !focus_flat.is_empty() && !exclude_flat.is_empty() {
+            bail!("--focus and --exclude cannot be used together");
+        }
+        if focus_flat.is_empty() && exclude_flat.is_empty() {
+            return Ok(Self {
+                focus_specs: Vec::new(),
+                focus: Vec::new(),
+                exclude: Vec::new(),
+                original_gateway: None,
+                nic_name: nic_name.to_string(),
+            });
+        }
+        split::require_admin()?;
+        let original = split::current_default_route()?;
+        println!(
+            "Original default gateway: {} (metric {})",
+            original.gateway, original.metric
+        );
+        if !focus_flat.is_empty() {
+            let targets = split::resolve_targets(&focus_flat)?;
+            print_focus_summary(&targets);
+            Ok(Self {
+                focus_specs: focus_flat,
+                focus: targets,
+                exclude: Vec::new(),
+                original_gateway: Some(original.gateway),
+                nic_name: nic_name.to_string(),
+            })
+        } else {
+            let targets = split::resolve_targets(&exclude_flat)?;
+            print_exclude_summary(&targets);
+            let entries = split::build_entries(&targets, &original.gateway);
+            println!(
+                "Pinning {} route(s) via original gateway {} ...",
+                entries.len(),
+                original.gateway
+            );
+            let (ok, failed) = split::apply_routes(&entries, 1);
+            println!("  routes added: {} ok, {} failed", ok, failed);
+            if failed > 0 && ok == 0 {
+                anyhow::bail!("No exclude routes could be added (need Administrator?)");
+            }
+            let state = split::SplitState {
+                mode: split::SplitMode::Exclude.as_str().to_string(),
+                specs: exclude_flat,
+                routes: entries,
+                gateway: original.gateway.clone(),
+            };
+            let path = split::save_state(&state)?;
+            println!("  saved split state: {}", path.display());
+            Ok(Self {
+                focus_specs: Vec::new(),
+                focus: Vec::new(),
+                exclude: targets,
+                original_gateway: Some(original.gateway),
+                nic_name: nic_name.to_string(),
+            })
+        }
+    }
+
+    fn pin_vpn_server_route(&self, server_ip: &str) -> Result<()> {
+        if self.focus_specs.is_empty() && self.exclude.is_empty() {
+            return Ok(());
+        }
+        let gw = match &self.original_gateway {
+            Some(g) => g.clone(),
+            None => return Ok(()),
+        };
+        if server_ip.parse::<std::net::IpAddr>().is_ok() && !server_ip.contains(':') {
+            let entry = split::RouteEntry {
+                dest: server_ip.to_string(),
+                mask_or_len: "255.255.255.255".to_string(),
+                gateway: gw.clone(),
+                v6: false,
+            };
+            println!("Pinning VPN server {} via {} ...", server_ip, gw);
+            let (ok, failed) = split::apply_routes(std::slice::from_ref(&entry), 1);
+            if failed > 0 {
+                anyhow::bail!(
+                    "Failed to pin VPN server route (need Administrator?): {} ok, {} failed",
+                    ok,
+                    failed
+                );
+            }
+            if let Ok(mut st) = split::load_state() {
+                let key = format!("{}|{}|{}", entry.dest, entry.mask_or_len, entry.gateway);
+                let exists = st
+                    .routes
+                    .iter()
+                    .any(|r| format!("{}|{}|{}", r.dest, r.mask_or_len, r.gateway) == key);
+                if !exists {
+                    st.routes.push(entry);
+                    let _ = split::save_state(&st);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn finish_after_connect(&self) -> Result<()> {
+        if self.focus_specs.is_empty() {
+            if !self.exclude.is_empty() {
+                println!("Exclude split active: listed domains stay on original connection.");
+                println!("Existing TCP was preserved (no reconnect).");
+            }
+            return Ok(());
+        }
+        let targets = match split::resolve_targets(&self.focus_specs) {
+            Ok(t) => t,
+            Err(e) => {
+                eprintln!("  [!] post-VPN DNS re-resolve failed: {:#}", e);
+                eprintln!("  [!] falling back to pre-VPN addresses.");
+                self.focus.clone()
+            }
+        };
+        let before = self.original_gateway.clone().unwrap_or_default();
+        let live = split::current_default_route()?;
+        let (gateway, via) = if live.gateway != before {
+            (live.gateway.clone(), format!("VPN gateway {}", live.gateway))
+        } else {
+            match split::vpn_interface_ip(&self.nic_name) {
+                Ok(ip) => ("on-link".to_string(), format!("VPN NIC {} (on-link)", ip)),
+                Err(e) => {
+                    eprintln!("  [!] no VPN default appeared and NIC IP unknown: {:#}", e);
+                    (live.gateway.clone(), format!("current default {}", live.gateway))
+                }
+            }
+        };
+        println!("VPN path: {}", via);
+        let entries = split::build_entries(&targets, &gateway);
+        println!("Routing {} route(s) via {} ...", entries.len(), via);
+        let (ok, failed) = split::apply_routes(&entries, 1);
+        println!("  routes added: {} ok, {} failed", ok, failed);
+        if failed > 0 && ok == 0 {
+            anyhow::bail!("No focus routes could be added (need Administrator?)");
+        }
+        let state = split::SplitState {
+            mode: split::SplitMode::Focus.as_str().to_string(),
+            specs: self.focus_specs.clone(),
+            routes: entries,
+            gateway,
+        };
+        let path = split::save_state(&state)?;
+        println!("  saved split state: {}", path.display());
+        println!("Focus split active: only listed domains use VPN; rest stays direct.");
+        Ok(())
+    }
+}
+
+fn print_focus_summary(targets: &[split::RouteTarget]) {
+    println!("Focus mode: only these go via VPN, everything else stays direct:");
+    for t in targets {
+        if let Some((net, len)) = t.cidr {
+            println!("  - {} -> {}/{}", t.spec, net, len);
+        } else {
+            let ips: Vec<String> = t.ips.iter().map(|ip| ip.to_string()).collect();
+            println!("  - {} -> {}", t.spec, ips.join(", "));
+        }
+    }
+    println!("NOTE: focus applies to NEW connections after VPN connects.");
+}
+
+fn print_exclude_summary(targets: &[split::RouteTarget]) {
+    println!("Exclude mode: these stay on original connection (existing TCP kept):");
+    for t in targets {
+        if let Some((net, len)) = t.cidr {
+            println!("  - {} -> {}/{}", t.spec, net, len);
+        } else {
+            let ips: Vec<String> = t.ips.iter().map(|ip| ip.to_string()).collect();
+            println!("  - {} -> {}", t.spec, ips.join(", "));
+        }
+    }
+}
+
+fn cmd_split(action: SplitAction) -> Result<()> {
+    match action {
+        SplitAction::Status => {
+            match split::load_state() {
+                Ok(st) => {
+                    println!("Split mode: {}", st.mode);
+                    println!("Targets:");
+                    for s in &st.specs {
+                        println!("  - {}", s);
+                    }
+                    println!("Routes ({}):", st.routes.len());
+                    for r in &st.routes {
+                        println!("  - {}/{} via {}", r.dest, r.mask_or_len, r.gateway);
+                    }
+                }
+                Err(_) => {
+                    println!("No split state saved yet.");
+                    println!("State file: {}", split::stored_state_path().display());
+                }
+            }
+            match split::current_default_route() {
+                Ok(d) => println!("Current default gateway: {} (metric {})", d.gateway, d.metric),
+                Err(e) => println!("Could not read default route: {:#}", e),
+            }
+        }
+        SplitAction::Refresh => {
+            refresh_split_routes()?;
+        }
+        SplitAction::Watch { interval } => {
+            let secs = interval.max(10);
+            println!("Watching split routes every {}s (Ctrl+C to stop)...", secs);
+            loop {
+                if let Err(e) = refresh_split_routes() {
+                    eprintln!("[!] refresh failed: {:#}", e);
+                }
+                sleep(Duration::from_secs(secs));
+            }
+        }
+        SplitAction::Clear => {
+            split::require_admin()?;
+            match split::load_state() {
+                Ok(st) => {
+                    println!("Removing {} split route(s)...", st.routes.len());
+                    split::remove_routes(&st.routes);
+                    let _ = std::fs::remove_file(split::stored_state_path());
+                    println!("Split routes cleared.");
+                }
+                Err(_) => println!("No saved split state; nothing to clear."),
+            }
+        }
+    }
+    Ok(())
+}
+
+fn refresh_split_routes() -> Result<()> {
+    refresh_split_routes_inner(None)?;
+    Ok(())
+}
+
+fn refresh_split_routes_inner(nic_hint: Option<&str>) -> Result<()> {
+    split::require_admin()?;
+    let st = split::load_state()?;
+    let mode = split::SplitMode::parse(&st.mode)
+        .ok_or_else(|| anyhow::anyhow!("Unknown split mode in state: {}", st.mode))?;
+    let targets = split::resolve_targets(&st.specs)?;
+    let gateway = match mode {
+        split::SplitMode::Focus => {
+            let live = split::current_default_route()?;
+            if live.gateway != st.gateway && !st.gateway.is_empty() && st.gateway != "on-link" {
+                live.gateway
+            } else if st.gateway.is_empty() {
+                live.gateway
+            } else {
+                st.gateway.clone()
+            }
+        }
+        split::SplitMode::Exclude => {
+            if st.gateway.is_empty() {
+                split::current_default_route()?.gateway
+            } else {
+                st.gateway.clone()
+            }
+        }
+    };
+    let _ = nic_hint;
+    let fresh = split::build_entries(&targets, &gateway);
+    let fresh_keys: std::collections::BTreeSet<String> = fresh
+        .iter()
+        .map(|r| format!("{}|{}|{}", r.dest, r.mask_or_len, r.gateway))
+        .collect();
+    let mut to_delete = Vec::new();
+    for r in &st.routes {
+        let key = format!("{}|{}|{}", r.dest, r.mask_or_len, r.gateway);
+        if r.gateway != gateway || !fresh_keys.contains(&key) {
+            to_delete.push(r.clone());
+        }
+    }
+    if st.routes.iter().any(|r| r.gateway != gateway) {
+        println!("Gateway changed. Rebuilding routes via {} ...", gateway);
+    }
+    split::remove_routes(&to_delete);
+    let (ok, failed) = split::apply_routes(&fresh, 1);
+    let new_state = split::SplitState {
+        mode: mode.as_str().to_string(),
+        specs: st.specs.clone(),
+        routes: fresh,
+        gateway,
+    };
+    let path = split::save_state(&new_state)?;
+    println!(
+        "Refreshed {} route(s): {} ok, {} failed. State: {}",
+        new_state.routes.len(),
+        ok,
+        failed,
+        path.display()
+    );
     Ok(())
 }
 

@@ -18,6 +18,9 @@
 - **Lifecycle Management**:
   - Auto detect / Create / Enable Virtual NIC.
   - Create / Connect / Check status / Disconnect / Delete connected accounts.
+- **Connect to Specific Domains**
+  - `--focus`: Only listed domains / IPs will be connected via VPN, everything else stays original connections..
+  - `--exclude`: Listed domains / IPs will stay on the original connection, existing connections won't be disconnected.
 
 ---
 
@@ -79,7 +82,41 @@ secli connect 219.100.37.7
 secli connect 219.100.37.7 -p 443
 ```
 
-### 4. Check current connection (`status`)
+### 4. Specify domains
+
+- `--focus` allows you to connect for only specified domains / IPs.
+- `--exclude` allows you to keep connections to all IPs except specified domains / IPs on the original route.
+
+Run as Administrator is required on Windows.
+
+```powershell
+# Only Discord goes via VPN, everything else stays direct
+secli connect --focus https://discord.com
+
+# Hypixel stays on the original connection and won't be disconnected.
+secli connect --exclude https://hypixel.net
+
+# Multiple targets or IP/CIDR specification is supported.
+secli connect --focus discord.com, fes.discord.com --focus 1.1.1.1
+
+# Connect with global arguments also work
+secli connect --exclude hypixel.net --exclude 20.0.0.0/8 -a
+
+# DNS changes? Re-resolve and refresh host routes
+secli split refresh
+
+# Keep following DNS (Ex: Hypixel / Discord rotate IPs)
+secli split watch --interval 300
+
+# Inspect / remove split routes
+secli split status
+secli split clear / secli disconnect
+```
+
+> [!NOTE]
+> You cannot combine --focus and --exclude at the same time
+
+### 5. Check current connection (`status`)
 
 View current connection status (Session info / Server info / Encryption method / Network usage).
 
@@ -87,7 +124,7 @@ View current connection status (Session info / Server info / Encryption method /
 secli status
 ```
 
-### 5. Disconnect (`disconnect`)
+### 6. Disconnect (`disconnect`)
 
 Disconnect from VPN server.
 
@@ -95,7 +132,7 @@ Disconnect from VPN server.
 secli disconnect
 ```
 
-### 6. Check virtual LAN Card, accounts
+### 7. Check virtual LAN Card, accounts
 
 ```powershell
 # List virtual LAN card (NIC)
@@ -114,7 +151,8 @@ Commands:
   install     Install to current user, register PATH
   list        List available VPN Gate servers
   connect     Connect the best matching server automatically
-  disconnect  Disconnect from VPN server
+  split       Inspect / refresh / clear split-tunnel host routes
+  disconnect  Disconnect from VPN server (Also clears split routes)
   status      View current connection status
   accounts    Check accounts
   nics        Check virtual LAN Card
@@ -127,4 +165,12 @@ Global / Connect / List Options:
       --max-ping <MAX_PING>    Maximum response time (ms)
       --min-speed <MIN_SPEED>  Minimum connection speed (Mbps)
       --nic <NIC>              Virtual LAN card to use (Default: VPN)
+      --focus <DOMAIN|IP|CIDR> Only these via VPN (repeatable, comma-separated OK)
+      --exclude <DOMAIN|IP|CIDR> Keep these on original connection, TCP preserved
+
+Split subcommands:
+  split status                 Show saved split targets / routes
+  split refresh                Re-resolve domains and refresh host routes
+  split watch --interval <SEC> Keep refreshing (default 300s, min 10s)
+  split clear                  Remove split host routes
 ```
