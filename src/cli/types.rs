@@ -45,7 +45,9 @@ pub struct Cli {
 
 #[derive(Subcommand)]
 pub enum Commands {
+    #[command(about = "Install to current user, register PATH")]
     Install,
+    #[command(about = "List available VPN Gate servers")]
     List {
         #[arg(long, short = 's', value_enum, default_value = "ping")]
         sort: SortKey,
@@ -63,6 +65,7 @@ pub enum Commands {
         limit: usize,
     },
 
+    #[command(about = "Connect the best matching server automatically")]
     Connect {
         #[arg(value_name = "IP")]
         ip: Option<String>,
@@ -95,33 +98,42 @@ pub enum Commands {
         exclude: Vec<String>,
     },
 
-    Split {
+    #[command(about = "Inspect / refresh / clear policy routes created by --focus / --exclude")]
+    Route {
         #[command(subcommand)]
-        action: SplitAction,
+        action: RouteAction,
     },
 
+    #[command(about = "Disconnect from VPN server (also clears policy routes)")]
     Disconnect {
         #[arg(default_value = DEFAULT_ACCOUNT_NAME)]
         account: String,
     },
 
+    #[command(about = "View current connection status")]
     Status {
         #[arg(default_value = DEFAULT_ACCOUNT_NAME)]
         account: String,
     },
 
+    #[command(about = "Check accounts")]
     Accounts,
+    #[command(about = "Check virtual LAN Card")]
     Nics,
 }
 
 #[derive(Subcommand)]
-pub enum SplitAction {
+pub enum RouteAction {
+    #[command(about = "Show saved route targets and host routes")]
     Status,
+    #[command(about = "Re-resolve domains and refresh host routes")]
     Refresh,
+    #[command(about = "Keep refreshing host routes periodically")]
     Watch {
         #[arg(long, default_value = "300")]
         interval: u64,
     },
+    #[command(about = "Remove policy host routes")]
     Clear,
 }
 

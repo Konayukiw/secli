@@ -103,18 +103,28 @@ secli connect --focus discord.com, fes.discord.com --focus 1.1.1.1
 secli connect --exclude hypixel.net --exclude 20.0.0.0/8 -a
 
 # DNS changes? Re-resolve and refresh host routes
-secli split refresh
+secli route refresh
 
 # Keep following DNS (Ex: Hypixel / Discord rotate IPs)
-secli split watch --interval 300
+secli route watch --interval 300
 
-# Inspect / remove split routes
-secli split status
-secli split clear / secli disconnect
+# Inspect / remove policy routes
+secli route status
+secli route clear / secli disconnect
 ```
 
 > [!NOTE]
 > You cannot combine --focus and --exclude at the same time
+
+#### Policy routes management (`route`)
+
+`connect --focus / --exclude` writes Windows host routes once, at connect time. The `route` command manages those routes afterwards:
+
+- `--focus discord.com`: Only these domains / IPs / CIDRs go via VPN, everything else stays direct.
+- `--exclude hypixel.net`: These domains / IPs / CIDRs stay on your original connection, everything else goes via VPN.
+- Domain IPs change over time (Discord, Hypixel, CDNs rotate addresses), so saved routes go stale. Use `secli route refresh` to re-resolve DNS and rewrite the routes, or `secli route watch --interval 300` to keep doing it periodically.
+- `secli route status`: Shows the saved targets and current host routes plus the active default gateway.
+- `secli route clear` / `secli disconnect`: Removes the policy routes.
 
 ### 5. Check current connection (`status`)
 
@@ -151,8 +161,8 @@ Commands:
   install     Install to current user, register PATH
   list        List available VPN Gate servers
   connect     Connect the best matching server automatically
-  split       Inspect / refresh / clear split-tunnel host routes
-  disconnect  Disconnect from VPN server (Also clears split routes)
+  route       Inspect / refresh / clear policy routes created by --focus / --exclude
+  disconnect  Disconnect from VPN server (Also clears policy routes)
   status      View current connection status
   accounts    Check accounts
   nics        Check virtual LAN Card
@@ -165,12 +175,12 @@ Global / Connect / List Options:
       --max-ping <MAX_PING>    Maximum response time (ms)
       --min-speed <MIN_SPEED>  Minimum connection speed (Mbps)
       --nic <NIC>              Virtual LAN card to use (Default: VPN)
-      --focus <DOMAIN|IP|CIDR> Only these via VPN (repeatable, comma-separated OK)
+      --focus <DOMAIN|IP|CIDR> Only these via VPN (Repeatable, comma-separated)
       --exclude <DOMAIN|IP|CIDR> Keep these on original connection, TCP preserved
 
-Split subcommands:
-  split status                 Show saved split targets / routes
-  split refresh                Re-resolve domains and refresh host routes
-  split watch --interval <SEC> Keep refreshing (default 300s, min 10s)
-  split clear                  Remove split host routes
+Route subcommands:
+  route status                 Show saved route targets / host routes
+  route refresh                Re-resolve domains and refresh host routes
+  route watch --interval <SEC> Keep refreshing (Default: 300s, min: 10s)
+  route clear                  Remove policy host routes
 ```

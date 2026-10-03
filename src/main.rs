@@ -2,7 +2,7 @@ mod cli;
 mod filter;
 mod installer;
 mod softether;
-mod split;
+mod route;
 mod vpngate;
 
 fn main() -> anyhow::Result<()> {

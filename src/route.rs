@@ -7,12 +7,12 @@ use std::path::PathBuf;
 use std::process::Command;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SplitMode {
+pub enum RouteMode {
     Focus,
     Exclude,
 }
 
-impl SplitMode {
+impl RouteMode {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Focus => "focus",
@@ -38,7 +38,7 @@ pub struct RouteTarget {
 }
 
 
-pub fn split_list_arg(values: &[String]) -> Vec<String> {
+pub fn expand_list_arg(values: &[String]) -> Vec<String> {
     let mut out = Vec::new();
     for v in values {
         for part in v.split(',') {
@@ -148,7 +148,7 @@ pub fn parse_target_spec(spec: &str) -> Result<RouteTarget> {
 }
 
 pub fn resolve_targets(specs: &[String]) -> Result<Vec<RouteTarget>> {
-    let flat = split_list_arg(specs);
+    let flat = expand_list_arg(specs);
     if flat.is_empty() {
         bail!("No targets given");
     }
@@ -200,7 +200,7 @@ pub struct DefaultRoute {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SplitState {
+pub struct RouteState {
     pub mode: String,
     pub specs: Vec<String>,
     pub routes: Vec<RouteEntry>,
@@ -214,20 +214,20 @@ fn state_path() -> Result<PathBuf> {
         .unwrap_or_else(|_| std::env::temp_dir());
     let dir = dir.join("SoftEther-CLI");
     fs::create_dir_all(&dir).context("Failed to create state dir")?;
-    Ok(dir.join("split_routes.json"))
+    Ok(dir.join("routes.json"))
 }
 
-pub fn save_state(state: &SplitState) -> Result<PathBuf> {
+pub fn save_state(state: &RouteState) -> Result<PathBuf> {
     let path = state_path()?;
     let json = serde_json::to_string_pretty(state)?;
     fs::write(&path, json)?;
     Ok(path)
 }
 
-pub fn load_state() -> Result<SplitState> {
+pub fn load_state() -> Result<RouteState> {
     let path = state_path()?;
     let data = fs::read_to_string(&path)
-        .with_context(|| format!("No split state at {}", path.display()))?;
+        .with_context(|| format!("No route state at {}", path.display()))?;
     Ok(serde_json::from_str(&data)?)
 }
 
@@ -500,7 +500,7 @@ pub fn remove_routes(entries: &[RouteEntry]) {
 }
 
 pub fn stored_state_path() -> PathBuf {
-    state_path().unwrap_or_else(|_| PathBuf::from("split_routes.json"))
+    state_path().unwrap_or_else(|_| PathBuf::from("routes.json"))
 }
 
 pub fn require_admin() -> Result<()> {
@@ -509,7 +509,7 @@ pub fn require_admin() -> Result<()> {
         .output()
         .context("Failed to run netsh")?;
     if !probe.status.success() {
-        bail!("Split routing needs an elevated terminal (run as Administrator).");
+        bail!("Route management needs an elevated terminal. Run as an administrator.");
     }
     Ok(())
 }
