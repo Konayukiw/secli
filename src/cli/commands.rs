@@ -1,4 +1,4 @@
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
 use clap::Parser;
 use std::thread::sleep;
 use std::time::Duration;
@@ -169,7 +169,7 @@ fn cmd_connect_direct(
     focus: Vec<String>,
     exclude: Vec<String>,
 ) -> Result<()> {
-    let plan = RoutePlan::prepare(focus, exclude, nic_name)?;
+    let mut plan = RoutePlan::prepare(focus, exclude, nic_name)?;
     let nic = VpnCmd::ensure_nic(nic_name)?;
 
     let port = if let Some(p) = custom_port {
@@ -199,6 +199,7 @@ fn cmd_connect_direct(
         DEFAULT_HUB,
         DEFAULT_USER,
         &nic,
+        plan.no_track(),
     )?;
 
     wait_for_connection(DEFAULT_ACCOUNT_NAME, ip, port, 10)?;
@@ -217,7 +218,7 @@ fn cmd_auto_connect(
     focus: Vec<String>,
     exclude: Vec<String>,
 ) -> Result<()> {
-    let plan = RoutePlan::prepare(focus, exclude, nic_name)?;
+    let mut plan = RoutePlan::prepare(focus, exclude, nic_name)?;
     let nic = VpnCmd::ensure_nic(nic_name)?;
 
     println!("Fetching available servers from VPN Gate...");
@@ -269,6 +270,7 @@ fn cmd_auto_connect(
             DEFAULT_HUB,
             DEFAULT_USER,
             &nic,
+            plan.no_track(),
         ) {
             println!("Failed: {}", e);
             continue;
@@ -327,15 +329,17 @@ fn wait_for_connection(
 
 fn cmd_disconnect(account: &str) -> Result<()> {
     println!("Disconnecting VPN session for '{}'...", account);
-    match route::load_state() {
-        Ok(st) => {
-            println!("Removing {} route(s)...", st.routes.len());
-            route::remove_routes(&st.routes);
-            let _ = std::fs::remove_file(route::stored_state_path());
-        }
-        Err(_) => {}
+    let state = route::load_state().ok();
+    if let Some(st) = &state {
+        route::restore_vpn_metric(st);
     }
     VpnCmd::disconnect(account)?;
+    if let Some(st) = &state {
+        println!("Removing {} route(s)...", st.routes.len() + st.pinned.len());
+        route::remove_routes(&st.routes);
+        route::remove_routes(&st.pinned);
+        let _ = std::fs::remove_file(route::stored_state_path());
+    }
     sleep(Duration::from_millis(500));
     VpnCmd::delete_account(account)?;
     println!("VPN disconnected and connection setting cleared.");
@@ -361,6 +365,7 @@ struct RoutePlan {
     exclude: Vec<route::RouteTarget>,
     original_gateway: Option<String>,
     nic_name: String,
+    pinned: Vec<route::RouteEntry>,
 }
 
 impl RoutePlan {
@@ -377,6 +382,7 @@ impl RoutePlan {
                 exclude: Vec::new(),
                 original_gateway: None,
                 nic_name: nic_name.to_string(),
+                pinned: Vec::new(),
             });
         }
         route::require_admin()?;
@@ -394,6 +400,7 @@ impl RoutePlan {
                 exclude: Vec::new(),
                 original_gateway: Some(original.gateway),
                 nic_name: nic_name.to_string(),
+                pinned: Vec::new(),
             })
         } else {
             let targets = route::resolve_targets(&exclude_flat)?;
@@ -414,6 +421,9 @@ impl RoutePlan {
                 specs: exclude_flat,
                 routes: entries,
                 gateway: original.gateway.clone(),
+                pinned: Vec::new(),
+                vpn_if_index: None,
+                vpn_if_metric: None,
             };
             let path = route::save_state(&state)?;
             println!("  saved route state: {}", path.display());
@@ -423,11 +433,16 @@ impl RoutePlan {
                 exclude: targets,
                 original_gateway: Some(original.gateway),
                 nic_name: nic_name.to_string(),
+                pinned: Vec::new(),
             })
         }
     }
 
-    fn pin_vpn_server_route(&self, server_ip: &str) -> Result<()> {
+    fn no_track(&self) -> bool {
+        !self.focus_specs.is_empty()
+    }
+
+    fn pin_vpn_server_route(&mut self, server_ip: &str) -> Result<()> {
         if self.focus_specs.is_empty() && self.exclude.is_empty() {
             return Ok(());
         }
@@ -451,14 +466,13 @@ impl RoutePlan {
                     failed
                 );
             }
-            if let Ok(mut st) = route::load_state() {
-                let key = format!("{}|{}|{}", entry.dest, entry.mask_or_len, entry.gateway);
-                let exists = st
-                    .routes
-                    .iter()
-                    .any(|r| format!("{}|{}|{}", r.dest, r.mask_or_len, r.gateway) == key);
-                if !exists {
-                    st.routes.push(entry);
+            let key = route::entry_key(&entry);
+            if !self.pinned.iter().any(|r| route::entry_key(r) == key) {
+                self.pinned.push(entry);
+            }
+            if !self.exclude.is_empty() {
+                if let Ok(mut st) = route::load_state() {
+                    st.pinned = self.pinned.clone();
                     let _ = route::save_state(&st);
                 }
             }
@@ -482,38 +496,55 @@ impl RoutePlan {
                 self.focus.clone()
             }
         };
-        let before = self.original_gateway.clone().unwrap_or_default();
-        let live = route::current_default_route()?;
-        let (gateway, via) = if live.gateway != before {
-            (live.gateway.clone(), format!("VPN gateway {}", live.gateway))
-        } else {
-            match route::vpn_interface_ip(&self.nic_name) {
-                Ok(ip) => ("on-link".to_string(), format!("VPN NIC {} (on-link)", ip)),
-                Err(e) => {
-                    eprintln!("  [!] No VPN default appeared and NIC IP unknown: {:#}", e);
-                    (live.gateway.clone(), format!("current default {}", live.gateway))
-                }
-            }
-        };
-        println!("VPN path: {}", via);
-        let entries = route::build_entries(&targets, &gateway);
-        println!("Routing {} route(s) via {} ...", entries.len(), via);
-        let (ok, failed) = route::apply_routes(&entries, 1);
-        println!("  routes added: {} ok, {} failed", ok, failed);
-        if failed > 0 && ok == 0 {
-            anyhow::bail!("No focus routes could be added. Try running as Administrator.");
-        }
+        let link = route::wait_vpn_link(&self.nic_name, Duration::from_secs(20))
+            .context("VPN interface did not receive a default gateway")?;
+        let original_metric = original_vpn_metric(link.if_index)?;
+        println!(
+            "VPN interface {} ({}), gateway {}: metric {} -> {}",
+            link.if_index,
+            link.ip,
+            link.gateway,
+            original_metric,
+            route::FOCUS_VPN_METRIC
+        );
+        route::set_interface_metric(link.if_index, route::FOCUS_VPN_METRIC)?;
+        let entries = route::build_entries(&targets, &link.gateway);
         let state = route::RouteState {
             mode: route::RouteMode::Focus.as_str().to_string(),
             specs: self.focus_specs.clone(),
-            routes: entries,
-            gateway,
+            routes: entries.clone(),
+            gateway: link.gateway.clone(),
+            pinned: self.pinned.clone(),
+            vpn_if_index: Some(link.if_index),
+            vpn_if_metric: Some(original_metric),
         };
         let path = route::save_state(&state)?;
+        println!("Routing {} route(s) via VPN gateway {} ...", entries.len(), link.gateway);
+        let (ok, failed) = route::apply_routes(&entries, 1);
+        println!("  routes added: {} ok, {} failed", ok, failed);
         println!("  saved route state: {}", path.display());
-        println!("Focus mode active: only listed domains use VPN; rest stays direct.");
+        if failed > 0 && ok == 0 {
+            bail!("No focus routes could be added. Run 'secli disconnect' to restore the VPN metric.");
+        }
+        println!("Focus mode active: only listed domains use VPN, the rest stays direct.");
         Ok(())
     }
+}
+
+fn original_vpn_metric(if_index: u32) -> Result<u32> {
+    if let Ok(st) = route::load_state() {
+        if st.vpn_if_index == Some(if_index) {
+            if let Some(m) = st.vpn_if_metric {
+                return Ok(m);
+            }
+        }
+    }
+    let current = route::interface_metric(if_index)?;
+    if current == route::FOCUS_VPN_METRIC {
+        eprintln!("  [!] VPN interface metric is already {}, assuming original 1", current);
+        return Ok(1);
+    }
+    Ok(current)
 }
 
 fn print_focus_summary(targets: &[route::RouteTarget]) {
@@ -555,6 +586,18 @@ fn cmd_route(action: RouteAction) -> Result<()> {
                     for r in &st.routes {
                         println!("  - {}/{} via {}", r.dest, r.mask_or_len, r.gateway);
                     }
+                    if !st.pinned.is_empty() {
+                        println!("VPN server pins ({}):", st.pinned.len());
+                        for r in &st.pinned {
+                            println!("  - {}/{} via {}", r.dest, r.mask_or_len, r.gateway);
+                        }
+                    }
+                    if let (Some(idx), Some(orig)) = (st.vpn_if_index, st.vpn_if_metric) {
+                        let now = route::interface_metric(idx)
+                            .map(|m| m.to_string())
+                            .unwrap_or_else(|_| "?".to_string());
+                        println!("VPN interface {}: metric {} (restores to {})", idx, now, orig);
+                    }
                 }
                 Err(_) => {
                     println!("No route state saved yet.");
@@ -585,7 +628,25 @@ fn cmd_route(action: RouteAction) -> Result<()> {
                 Ok(st) => {
                     println!("Removing {} route(s)...", st.routes.len());
                     route::remove_routes(&st.routes);
-                    let _ = std::fs::remove_file(route::stored_state_path());
+                    route::restore_vpn_metric(&st);
+                    if st.pinned.is_empty() {
+                        let _ = std::fs::remove_file(route::stored_state_path());
+                    } else {
+                        let kept = route::RouteState {
+                            mode: st.mode.clone(),
+                            specs: Vec::new(),
+                            routes: Vec::new(),
+                            gateway: st.gateway.clone(),
+                            pinned: st.pinned.clone(),
+                            vpn_if_index: None,
+                            vpn_if_metric: None,
+                        };
+                        route::save_state(&kept)?;
+                        println!(
+                            "Kept {} VPN server pin(s) until 'secli disconnect'.",
+                            st.pinned.len()
+                        );
+                    }
                     println!("Routes cleared.");
                 }
                 Err(_) => println!("No saved route state, nothing to clear."),
@@ -607,6 +668,13 @@ fn refresh_routes_inner(nic_hint: Option<&str>) -> Result<()> {
         .ok_or_else(|| anyhow::anyhow!("Unknown route mode in state: {}", st.mode))?;
     let targets = route::resolve_targets(&st.specs)?;
     let gateway = match mode {
+        route::RouteMode::Focus if st.vpn_if_index.is_some() => {
+            let idx = st.vpn_if_index.unwrap_or_default();
+            route::default_gateway_on(idx).unwrap_or_else(|e| {
+                eprintln!("  [!] {:#}, keeping {}", e, st.gateway);
+                st.gateway.clone()
+            })
+        }
         route::RouteMode::Focus => {
             let live = route::current_default_route()?;
             if live.gateway != st.gateway && !st.gateway.is_empty() && st.gateway != "on-link" {
@@ -648,6 +716,9 @@ fn refresh_routes_inner(nic_hint: Option<&str>) -> Result<()> {
         specs: st.specs.clone(),
         routes: fresh,
         gateway,
+        pinned: st.pinned.clone(),
+        vpn_if_index: st.vpn_if_index,
+        vpn_if_metric: st.vpn_if_metric,
     };
     let path = route::save_state(&new_state)?;
     println!(

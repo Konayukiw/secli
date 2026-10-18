@@ -1,10 +1,14 @@
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::fs;
-use std::net::{IpAddr, ToSocketAddrs};
+use std::net::{IpAddr, Ipv4Addr, ToSocketAddrs};
 use std::path::PathBuf;
 use std::process::Command;
+use std::thread::sleep;
+use std::time::{Duration, Instant};
+
+pub const FOCUS_VPN_METRIC: u32 = 9000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RouteMode {
@@ -206,6 +210,23 @@ pub struct RouteState {
     pub routes: Vec<RouteEntry>,
     #[serde(default)]
     pub gateway: String,
+    #[serde(default)]
+    pub pinned: Vec<RouteEntry>,
+    #[serde(default)]
+    pub vpn_if_index: Option<u32>,
+    #[serde(default)]
+    pub vpn_if_metric: Option<u32>,
+}
+
+#[derive(Debug, Clone)]
+pub struct VpnLink {
+    pub if_index: u32,
+    pub ip: String,
+    pub gateway: String,
+}
+
+pub fn entry_key(e: &RouteEntry) -> String {
+    format!("{}|{}|{}", e.dest, e.mask_or_len, e.gateway)
 }
 
 fn state_path() -> Result<PathBuf> {
@@ -279,10 +300,11 @@ fn run_route(args: &[&str]) -> Result<String> {
 
 pub fn current_default_route() -> Result<DefaultRoute> {
     let text = run_netsh(&["interface", "ipv4", "show", "route"])?;
-    best_default_from_netsh(&text).context("No IPv4 default route found")
+    let metrics = interface_metrics().unwrap_or_default();
+    best_default_from_netsh(&text, &metrics).context("No IPv4 default route found")
 }
 
-fn best_default_from_netsh(text: &str) -> Option<DefaultRoute> {
+fn best_default_from_netsh(text: &str, if_metrics: &HashMap<u32, u32>) -> Option<DefaultRoute> {
     let mut best: Option<DefaultRoute> = None;
     for line in text.lines() {
         let cols: Vec<&str> = line.split_whitespace().collect();
@@ -290,16 +312,20 @@ fn best_default_from_netsh(text: &str) -> Option<DefaultRoute> {
             continue;
         }
         let prefix_ok = cols[3] == "0.0.0.0/0";
-        let gw_ok = cols[5].parse::<std::net::Ipv4Addr>().is_ok();
+        let gw_ok = cols[5].parse::<Ipv4Addr>().is_ok();
         if !prefix_ok || !gw_ok {
             continue;
         }
-        let metric: u32 = cols[2].parse().unwrap_or(u32::MAX);
+        let if_index: Option<u32> = cols[4].parse().ok();
+        let route_metric: u32 = cols[2].parse().unwrap_or(u32::MAX);
+        let if_metric = if_index
+            .and_then(|i| if_metrics.get(&i).copied())
+            .unwrap_or(0);
         let cand = DefaultRoute {
             gateway: cols[5].to_string(),
             interface_ip: String::new(),
-            if_index: cols[4].parse().ok(),
-            metric,
+            if_index,
+            metric: route_metric.saturating_add(if_metric),
         };
         let take = match &best {
             Some(b) => cand.metric < b.metric,
@@ -337,6 +363,104 @@ pub fn vpn_interface_ip(nic_name: &str) -> Result<String> {
     let text = run_netsh(&["interface", "ipv4", "show", "addresses"])?;
     parse_nic_ip(&text, nic_name)
         .with_context(|| format!("Could not find DHCP/IP address for NIC '{}'", nic_name))
+}
+
+pub fn interface_metrics() -> Result<HashMap<u32, u32>> {
+    let text = run_netsh(&["interface", "ipv4", "show", "interfaces"])?;
+    Ok(parse_interface_metrics(&text))
+}
+
+fn parse_interface_metrics(text: &str) -> HashMap<u32, u32> {
+    let mut out = HashMap::new();
+    for line in text.lines() {
+        let cols: Vec<&str> = line.split_whitespace().collect();
+        if cols.len() < 3 {
+            continue;
+        }
+        if let (Ok(idx), Ok(met)) = (cols[0].parse::<u32>(), cols[1].parse::<u32>()) {
+            out.insert(idx, met);
+        }
+    }
+    out
+}
+
+pub fn interface_metric(if_index: u32) -> Result<u32> {
+    interface_metrics()?
+        .get(&if_index)
+        .copied()
+        .with_context(|| format!("Interface {} not found", if_index))
+}
+
+pub fn set_interface_metric(if_index: u32, metric: u32) -> Result<()> {
+    run_netsh(&[
+        "interface", "ipv4", "set", "interface",
+        &format!("interface={}", if_index),
+        &format!("metric={}", metric),
+    ])?;
+    Ok(())
+}
+
+pub fn restore_vpn_metric(state: &RouteState) {
+    if let (Some(idx), Some(metric)) = (state.vpn_if_index, state.vpn_if_metric) {
+        match set_interface_metric(idx, metric) {
+            Ok(()) => println!("Restored VPN interface {} metric to {}", idx, metric),
+            Err(e) => eprintln!("  [!] metric restore warning: {:#}", e),
+        }
+    }
+}
+
+pub fn default_gateway_on(if_index: u32) -> Result<String> {
+    let text = run_netsh(&["interface", "ipv4", "show", "route"])?;
+    parse_default_gateway_on(&text, if_index)
+        .with_context(|| format!("No default route on interface {}", if_index))
+}
+
+fn parse_default_gateway_on(text: &str, if_index: u32) -> Option<String> {
+    text.lines().find_map(|line| {
+        let cols: Vec<&str> = line.split_whitespace().collect();
+        let hit = cols.len() >= 6
+            && cols[3] == "0.0.0.0/0"
+            && cols[4].parse::<u32>().ok() == Some(if_index)
+            && cols[5].parse::<Ipv4Addr>().is_ok();
+        hit.then(|| cols[5].to_string())
+    })
+}
+
+fn parse_owner_index(text: &str, ip: &str) -> Option<u32> {
+    let host = format!("{}/32", ip);
+    text.lines().find_map(|line| {
+        let cols: Vec<&str> = line.split_whitespace().collect();
+        if cols.len() >= 5 && cols[3] == host {
+            cols[4].parse::<u32>().ok()
+        } else {
+            None
+        }
+    })
+}
+
+pub fn vpn_link(nic_name: &str) -> Result<VpnLink> {
+    let ip = vpn_interface_ip(nic_name)?;
+    let text = run_netsh(&["interface", "ipv4", "show", "route"])?;
+    let if_index = parse_owner_index(&text, &ip)
+        .with_context(|| format!("No interface owns {}", ip))?;
+    let gateway = parse_default_gateway_on(&text, if_index)
+        .with_context(|| format!("No default route on VPN interface {} yet", if_index))?;
+    Ok(VpnLink {
+        if_index,
+        ip,
+        gateway,
+    })
+}
+
+pub fn wait_vpn_link(nic_name: &str, timeout: Duration) -> Result<VpnLink> {
+    let start = Instant::now();
+    loop {
+        match vpn_link(nic_name) {
+            Ok(link) => return Ok(link),
+            Err(e) if start.elapsed() >= timeout => return Err(e),
+            Err(_) => sleep(Duration::from_millis(500)),
+        }
+    }
 }
 
 fn parse_nic_ip(text: &str, nic_name: &str) -> Option<String> {
@@ -512,4 +636,67 @@ pub fn require_admin() -> Result<()> {
         bail!("Route management needs an elevated terminal. Run as an administrator.");
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const ROUTES: &str = "\
+Publish  Type      Met  Prefix                    Idx  Gateway/Interface Name
+-------  --------  ---  ------------------------  ---  ------------------------
+No       Manual    1    0.0.0.0/0                   9  10.211.254.254
+No       Manual    0    0.0.0.0/0                   5  192.168.11.1
+No       System    256  10.211.0.0/16               9  VPN - VPN Client
+No       System    256  10.211.1.23/32              9  VPN - VPN Client
+No       System    256  192.168.11.12/32            5  Wi-Fi
+";
+
+    const INTERFACES: &str = "\
+Idx     Met         MTU          State                Name
+---  ----------  ----------  ------------  ---------------------------
+  1          75  4294967295  connected     Loopback Pseudo-Interface 1
+  9        9000        1500  connected     VPN - VPN Client
+  5          35        1500  connected     Wi-Fi
+";
+
+    #[test]
+    fn test_parse_interface_metrics() {
+        let m = parse_interface_metrics(INTERFACES);
+        assert_eq!(m.get(&9), Some(&9000));
+        assert_eq!(m.get(&5), Some(&35));
+        assert_eq!(m.len(), 3);
+    }
+
+    #[test]
+    fn test_best_default_uses_interface_metric() {
+        let mut m = parse_interface_metrics(INTERFACES);
+        let best = best_default_from_netsh(ROUTES, &m).unwrap();
+        assert_eq!(best.gateway, "192.168.11.1");
+        assert_eq!(best.metric, 35);
+        m.insert(9, 1);
+        let best = best_default_from_netsh(ROUTES, &m).unwrap();
+        assert_eq!(best.gateway, "10.211.254.254");
+        assert_eq!(best.metric, 2);
+    }
+
+    #[test]
+    fn test_vpn_link_parsers() {
+        assert_eq!(parse_owner_index(ROUTES, "10.211.1.23"), Some(9));
+        assert_eq!(parse_owner_index(ROUTES, "10.0.0.1"), None);
+        assert_eq!(
+            parse_default_gateway_on(ROUTES, 9).as_deref(),
+            Some("10.211.254.254")
+        );
+        assert_eq!(parse_default_gateway_on(ROUTES, 3), None);
+    }
+
+    #[test]
+    fn test_old_state_deserializes() {
+        let json = r#"{"mode":"focus","specs":["a.com"],"routes":[],"gateway":"on-link"}"#;
+        let st: RouteState = serde_json::from_str(json).unwrap();
+        assert!(st.pinned.is_empty());
+        assert_eq!(st.vpn_if_index, None);
+        assert_eq!(st.vpn_if_metric, None);
+    }
 }

@@ -126,6 +126,9 @@ secli route clear / secli disconnect
 - `secli route status`: Shows the saved targets and current host routes plus the active default gateway.
 - `secli route clear` / `secli disconnect`: Removes the policy routes.
 
+> [!NOTE]
+> In `--focus` mode, secli turns off SoftEther's routing table adjustment (`AccountDetailSet /NOTRACK:yes`) so your original default route is kept, and raises the VPN adapter's interface metric to 9000 so non-listed traffic stays direct. The original metric is saved in the route state and restored by `secli disconnect` or `secli route clear`.
+
 ### 5. Check current connection (`status`)
 
 View current connection status (Session info / Server info / Encryption method / Network usage).
@@ -169,14 +172,14 @@ Commands:
   help        Show help
 
 Global / Connect / List Options:
-  -a, --auto                   Auto connect
-  -s, --sort <SORT>            Sort: [ping, country, speed, score, sessions] (Default: ping)
-  -c, --country <COUNTRY>      Country code (ISO 3166-1 Alpha-2, Ex: JP, US)
-      --max-ping <MAX_PING>    Maximum response time (ms)
-      --min-speed <MIN_SPEED>  Minimum connection speed (Mbps)
-      --nic <NIC>              Virtual LAN card to use (Default: VPN)
-      --focus <DOMAIN|IP|CIDR> Only these via VPN (Repeatable, comma-separated)
-      --exclude <DOMAIN|IP|CIDR> Keep these on original connection, TCP preserved
+  -a, --auto                      Auto connect
+  -s, --sort <SORT>               Sort: [ping, country, speed, score, sessions] (Default: ping)
+  -c, --country <COUNTRY>         Country code (ISO 3166-1 Alpha-2, Ex: JP, US)
+      --max-ping <MAX_PING>       Maximum response time (ms)
+      --min-speed <MIN_SPEED>     Minimum connection speed (Mbps)
+      --nic <NIC>                 Virtual LAN card to use (Default: VPN)
+      --focus <DOMAIN|IP|CIDR>    Only these via VPN (Repeatable, comma-separated)
+      --exclude <DOMAIN|IP|CIDR>  Keep these on original connection, TCP preserved
 
 Route subcommands:
   route status                 Show saved route targets / host routes

@@ -70,6 +70,7 @@ impl VpnCmd {
         hub: &str,
         username: &str,
         nic_name: &str,
+        no_track: bool,
     ) -> Result<()> {
         let _ = Self::disconnect(account_name);
         sleep(Duration::from_millis(500));
@@ -90,6 +91,22 @@ impl VpnCmd {
             &nic_arg,
         ])
         .context("Failed to create VPN account")?;
+
+        if no_track {
+            Self::execute(&[
+                "AccountDetailSet",
+                account_name,
+                "/MAXTCP:1",
+                "/INTERVAL:1",
+                "/TTL:0",
+                "/HALF:no",
+                "/BRIDGE:no",
+                "/MONITOR:no",
+                "/NOTRACK:yes",
+                "/NOQOS:no",
+            ])
+            .context("Failed to disable routing table tracking")?;
+        }
 
         let _ = Self::execute(&["AccountRetrySet", account_name, "/NUM:3", "/RETRYINT:3"]);
 
